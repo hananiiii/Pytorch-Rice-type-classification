@@ -22,6 +22,18 @@ import matplotlib.pyplot as plt # Plotting the training progress at the end
 import pandas as pd # Data reading and preprocessing
 import numpy as np # Mathematical operations
 
+import random
+def set_seeds(seed=42):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seeds(42)
+
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 device
 
@@ -57,10 +69,17 @@ plt.suptitle("Feature Distributions")
 plt.tight_layout()
 plt.show()
 
-before_normalize_data= data_df.copy()
-for col in data_df.columns :
-  data_df[col]=data_df[col]/data_df[col].abs().max()
-data_df.head()
+from sklearn.preprocessing import StandardScaler
+
+# Split FIRST, then normalize
+X = np.array(data_df.iloc[:,:-1])
+Y = np.array(data_df.iloc[:,-1])
+X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.3, random_state=42)
+X_test, X_val, y_test, y_val = train_test_split(X_test, y_test, test_size=0.5, random_state=42)
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_val = scaler.transform(X_val)
+X_test = scaler.transform(X_test)
 
 """split data
 
@@ -71,14 +90,7 @@ Validation Size 15%
 Testing Size 15%
 """
 
-#df.iloc[ row_selection , column_selection ]
-X=np.array(data_df.iloc[:,:-1])
-Y=np.array(data_df.iloc[:,-1])
-X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size = 0.3) # Create the training split
-X_test, X_val, y_test, y_val = train_test_split(X_test, y_test, test_size = 0.5) # Create the validation split
-print("Training set is: ", X_train.shape[0], " rows which is ", round(X_train.shape[0]/data_df.shape[0],4)*100, "%") # Print training shape
-print("Validation set is: ",X_val.shape[0], " rows which is ", round(X_val.shape[0]/data_df.shape[0],4)*100, "%") # Print validation shape
-print("Testing set is: ",X_test.shape[0], " rows which is ", round(X_test.shape[0]/data_df.shape[0],4)*100, "%") # Print testing shape
+
 
 class dataset(Dataset):
     def __init__(self, X, Y):
@@ -94,30 +106,30 @@ training_data = dataset(X_train, y_train)
 validation_data = dataset(X_val, y_val)
 testing_data = dataset(X_test, y_test)
 
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 EPOCHS = 100
 HIDDEN_NEURONS = 10
-LR =0.1
+LR =0.001
 
 train_dataloader = DataLoader(training_data, batch_size=BATCH_SIZE, shuffle= True)
 validation_dataloader = DataLoader(validation_data, batch_size=BATCH_SIZE, shuffle= True)
 testing_dataloader = DataLoader(testing_data, batch_size=BATCH_SIZE, shuffle= True)
 
-from torch import nn
 class MyModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.layer_1 = nn.Linear(X.shape[1], HIDDEN_NEURONS)
+        self.bn1 = nn.BatchNorm1d(HIDDEN_NEURONS)
         self.layer_2 = nn.Linear(HIDDEN_NEURONS, HIDDEN_NEURONS)
-        self.layer_3 = nn.Linear(HIDDEN_NEURONS, out_features=1)
-        self.relu = nn.ReLU() # <- add in ReLU activation function
-        # Can also put sigmoid in the model
-        # This would mean you don't need to use it on the predictions
-        # self.sigmoid = nn.Sigmoid()
+        self.bn2 = nn.BatchNorm1d(HIDDEN_NEURONS)
+        self.layer_3 = nn.Linear(HIDDEN_NEURONS, 1)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.3)
 
     def forward(self, x):
-      # Intersperse the ReLU activation function between layers
-       return self.layer_3(self.relu(self.layer_2(self.relu(self.layer_1(x)))))
+        x = self.dropout(self.relu(self.bn1(self.layer_1(x))))
+        x = self.dropout(self.relu(self.bn2(self.layer_2(x))))
+        return self.layer_3(x)
 
 model = MyModel().to(device)
 print(model)
@@ -141,20 +153,23 @@ model = MyModel().to(device)
 summary(model, (X.shape[1],))
 
 criterion = nn.BCEWithLogitsLoss()
-optimizer = torch.optim.SGD(model.parameters(), lr= LR)
+optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-5)
 
-# Assuming you have these from your code
-from sklearn.metrics import accuracy_score
-import torch
+# ADD THIS LINE:
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=10, factor=0.5)
 
-# Lists to store metrics
 total_loss_train = []
 total_loss_val = []
 total_acc_train = []
 total_acc_val = []
 
-# Training loop (example)
-num_epochs = 100  # Adjust based on your setup
+# Early stopping variables
+best_val_acc = 0
+patience_counter = 0
+patience = 20
+
+# Training loop
+num_epochs = 100
 for epoch in range(num_epochs):
     # Training phase
     model.train()
@@ -163,14 +178,14 @@ for epoch in range(num_epochs):
     train_labels = []
     for inputs, labels in train_dataloader:
         inputs, labels = inputs.to(device), labels.to(device)
-        labels = labels.float()  # Ensure labels are float
+        labels = labels.float()
         optimizer.zero_grad()
-        outputs = model(inputs).squeeze()  # Shape: [batch_size]
-        loss = criterion(outputs, labels)  # Shapes match
+        outputs = model(inputs).squeeze()
+        loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
         train_loss += loss.item()
-        preds = (torch.sigmoid(outputs) > 0.5).float().cpu().numpy()  # Threshold at 0.5
+        preds = (torch.sigmoid(outputs) > 0.5).float().cpu().numpy()
         train_preds.extend(preds)
         train_labels.extend(labels.cpu().numpy())
 
@@ -179,7 +194,7 @@ for epoch in range(num_epochs):
     total_loss_train.append(train_loss)
     total_acc_train.append(train_acc)
 
-    # Validation phase (similar changes)
+    # Validation phase
     model.eval()
     val_loss = 0.0
     val_preds = []
@@ -187,9 +202,9 @@ for epoch in range(num_epochs):
     with torch.no_grad():
         for inputs, labels in validation_dataloader:
             inputs, labels = inputs.to(device), labels.to(device)
-            labels = labels.float()  # Ensure labels are float
-            outputs = model(inputs).squeeze()  # Shape: [batch_size]
-            loss = criterion(outputs, labels)  # Shapes match
+            labels = labels.float()
+            outputs = model(inputs).squeeze()
+            loss = criterion(outputs, labels)
             val_loss += loss.item()
             preds = (torch.sigmoid(outputs) > 0.5).float().cpu().numpy()
             val_preds.extend(preds)
@@ -200,7 +215,29 @@ for epoch in range(num_epochs):
     total_loss_val.append(val_loss)
     total_acc_val.append(val_acc)
 
-    print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}')
+    # ADD THESE LINES FOR LEARNING RATE SCHEDULING AND EARLY STOPPING:
+    scheduler.step(val_loss)  # Update learning rate
+
+    # Early stopping logic
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        patience_counter = 0
+        torch.save(model.state_dict(), 'best_model.pth')  # Save best model
+    else:
+        patience_counter += 1
+
+    if patience_counter >= patience:
+        print(f"Early stopping at epoch {epoch+1}")
+        break
+
+    # Print progress every 10 epochs
+    if (epoch + 1) % 10 == 0:
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}, LR: {current_lr:.6f}')
+
+# 5. LOAD BEST MODEL FOR FINAL TESTING (add before your testing section):
+model.load_state_dict(torch.load('best_model.pth'))
+print(f"Loaded best model with validation accuracy: {best_val_acc:.4f}")
 
 def predict_single_row(model, row, device):
     model.eval()
@@ -250,58 +287,62 @@ with torch.inference_mode():
 print(f"Test Loss: {total_loss_test / len(testing_dataloader):.4f} | "
       f"Test Acc: {total_acc_test / len(testing_data) * 100:.2f}%")
 
-fig, axs = plt.subplots(nrows=1, ncols=2, figsize=(15, 5))
-
-axs[0].plot(total_loss_train, label='Training Loss')
-axs[0].plot(total_loss_val, label='Validation Loss')
-axs[0].set_title('Training and Validation Loss over Epochs')
-axs[0].set_xlabel('Epochs')
-axs[0].set_ylabel('Loss')
-axs[0].set_ylim([0, 2])
-axs[0].legend()
-
-axs[1].plot(total_loss_train, label='Training Accuracy')
-axs[1].plot(total_loss_val, label='Validation Accuracy')
-axs[1].set_title('Training and Validation Accuracy over Epochs')
-axs[1].set_xlabel('Epochs')
-axs[1].set_ylabel('Accuracy')
-axs[1].set_ylim([0, 100])
-axs[1].legend()
-
-plt.tight_layout()
-
-plt.show()
-
 model.eval()
 with torch.inference_mode():
-  # 3. Make sure the calculations are done with the model and data on the same device
-  # in our case, we haven't setup device-agnostic code yet so our data and model are
-  # on the CPU by default.
-  # model_0.to(device)
-  # X_test = X_test.to(device)
-  X_test_tensor = torch.FloatTensor(X_test)
-  y_test_tensor = torch.FloatTensor(y_test).unsqueeze(1)
-  device = torch.device("cpu")
-  y_preds = model(X_test_tensor)
-y_preds
+    X_test_tensor = torch.FloatTensor(X_test).to(device)
+    y_test_tensor = torch.FloatTensor(y_test).to(device)
 
-import matplotlib.pyplot as plt
-import torch
+    # Get logits and convert to probabilities
+    logits = model(X_test_tensor)
+    probabilities = torch.sigmoid(logits)
+    predictions = (probabilities > 0.5).float()
 
-# Convert tensors to NumPy for plotting
-y_preds_numpy = y_preds.cpu().numpy()
-y_test_numpy = y_test_tensor.cpu().numpy()
+    # Convert to numpy for plotting
+    probs_np = probabilities.cpu().numpy().flatten()
+    preds_np = predictions.cpu().numpy().flatten()
+    y_test_np = y_test_tensor.cpu().numpy()
 
-plt.figure(figsize=(8, 5))
-plt.plot(y_test_numpy, label="Actual", marker='o')
-plt.plot(y_preds_numpy, label="Predicted", marker='x')
+fig, axes = plt.subplots(2, 2, figsize=(15, 10))
 
-plt.title("Model Predictions vs Actual Values")
-plt.xlabel("Sample Index")
-plt.ylabel("Value")
-plt.legend()
-plt.grid(True)
+# Plot 1: Loss curves
+axes[0,0].plot(total_loss_train, label='Training Loss', alpha=0.7)
+axes[0,0].plot(total_loss_val, label='Validation Loss', alpha=0.7)
+axes[0,0].set_title('Training and Validation Loss')
+axes[0,0].set_xlabel('Epoch')
+axes[0,0].set_ylabel('Loss')
+axes[0,0].legend()
+axes[0,0].grid(True, alpha=0.3)
+
+# Plot 2: Accuracy curves
+axes[0,1].plot([acc*100 for acc in total_acc_train], label='Training Accuracy', alpha=0.7)
+axes[0,1].plot([acc*100 for acc in total_acc_val], label='Validation Accuracy', alpha=0.7)
+axes[0,1].set_title('Training and Validation Accuracy')
+axes[0,1].set_xlabel('Epoch')
+axes[0,1].set_ylabel('Accuracy (%)')
+axes[0,1].legend()
+axes[0,1].grid(True, alpha=0.3)
+
+# Plot 3: Predicted probabilities
+axes[1,0].scatter(range(len(probs_np)), probs_np, c=y_test_np, alpha=0.6, cmap='viridis')
+axes[1,0].axhline(y=0.5, color='red', linestyle='--', label='Decision Threshold')
+axes[1,0].set_xlabel('Sample Index')
+axes[1,0].set_ylabel('Predicted Probability')
+axes[1,0].set_title('Predicted Probabilities vs True Labels')
+axes[1,0].legend()
+
+# Plot 4: Confusion matrix visualization
+axes[1,1].scatter(y_test_np, preds_np, alpha=0.6, s=50)
+axes[1,1].plot([0, 1], [0, 1], 'r--', label='Perfect Prediction')
+axes[1,1].set_xlabel('True Labels')
+axes[1,1].set_ylabel('Predicted Labels')
+axes[1,1].set_title('Predicted vs True Labels')
+axes[1,1].legend()
+
+plt.tight_layout()
 plt.show()
+
+final_accuracy = accuracy_score(y_test_np, preds_np)
+print(f"Final Test Accuracy: {final_accuracy:.4f} ({final_accuracy*100:.2f}%)")
 
 import torch
 
